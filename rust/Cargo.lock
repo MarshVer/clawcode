@@ -21,6 +21,7 @@ dependencies = [
 name = "api"
 version = "0.1.0"
 dependencies = [
+ "claw-core",
  "reqwest",
  "runtime",
  "serde",
@@ -98,6 +99,15 @@ name = "cfg_aliases"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "613afe47fcd5fac7ccf1db93babcb082c5994d996f20b8b159f2ad1658eb5724"
+
+[[package]]
+name = "claw-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
 
 [[package]]
 name = "clipboard-win"
@@ -1111,12 +1121,13 @@ dependencies = [
 name = "runtime"
 version = "0.1.0"
 dependencies = [
+ "claw-core",
+ "fd-lock",
  "glob",
  "plugins",
  "regex",
  "serde",
  "serde_json",
- "sha2",
  "telemetry",
  "tokio",
  "walkdir",
@@ -1200,6 +1211,7 @@ name = "rusty-claude-cli"
 version = "0.1.0"
 dependencies = [
  "api",
+ "claw-core",
  "commands",
  "compat-harness",
  "crossterm",
@@ -1579,6 +1591,7 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "api",
+ "claw-core",
  "commands",
  "flate2",
  "plugins",

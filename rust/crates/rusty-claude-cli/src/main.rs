@@ -8,6 +8,7 @@
 )]
 mod init;
 mod input;
+mod diff_report;
 mod render;
 
 use std::collections::BTreeSet;
@@ -24,12 +25,17 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use api::{
-    detect_provider_kind, metadata_for_model, oauth_token_is_expired,
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
-    PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
-    StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
+    detect_provider_kind, dynamic_max_tokens_for_request, metadata_for_model,
+    oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
+    runtime_messages_to_input_messages, ContentBlockDelta, InputMessage, MessageRequest, MessageResponse,
+    OutputContentBlock, PromptCache, ProviderClient as ApiProviderClient, ProviderKind,
+    RuntimeContentBlock as ApiRuntimeContentBlock,
+    RuntimeConversationMessage as ApiRuntimeConversationMessage,
+    RuntimeMessageRole as ApiRuntimeMessageRole, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition,
 };
+use claw_core::ModelCapability;
+use diff_report::{render_diff_json_for, render_diff_report_for};
 
 use commands::{
     classify_skills_slash_command, handle_agents_slash_command, handle_agents_slash_command_json,
@@ -60,13 +66,6 @@ use tools::{
 };
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
-fn max_tokens_for_model(model: &str) -> u32 {
-    if model.contains("opus") {
-        32_000
-    } else {
-        64_000
-    }
-}
 // Build-time constants injected by build.rs (fall back to static values when
 // build.rs hasn't run, e.g. in doc-test or unusual toolchain environments).
 const BUILD_DATE: &str = match option_env!("BUILD_DATE") {
@@ -1105,6 +1104,18 @@ fn config_model_for_current_dir() -> Option<String> {
     loader.load().ok()?.model().map(ToOwned::to_owned)
 }
 
+fn config_model_capability_for_current_dir(model: &str) -> Option<ModelCapability> {
+    let cwd = env::current_dir().ok()?;
+    let loader = ConfigLoader::default_for(&cwd);
+    let config = loader.load().ok()?;
+    let resolved = api::resolve_model_alias(model);
+    config
+        .model_capabilities()
+        .get(&resolved.to_ascii_lowercase())
+        .or_else(|| config.model_capabilities().get(&model.to_ascii_lowercase()))
+        .copied()
+}
+
 fn normalize_optional_text(value: Option<&str>) -> Option<String> {
     value
         .map(str::trim)
@@ -1117,10 +1128,16 @@ fn binary_startup_config_candidates() -> Vec<PathBuf> {
         return vec![path];
     }
 
+    let mut paths = vec![binary_startup_config_home_path()];
     let Ok(exe) = env::current_exe() else {
-        return Vec::new();
+        return paths;
     };
-    binary_startup_config_candidates_for_exe(&exe)
+    for path in binary_startup_config_candidates_for_exe(&exe) {
+        if !paths.iter().any(|existing| existing == &path) {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 fn binary_startup_config_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
@@ -1135,6 +1152,15 @@ fn binary_startup_config_candidates_for_exe(exe: &Path) -> Vec<PathBuf> {
         }
     }
     paths
+}
+
+fn binary_startup_config_home_path() -> PathBuf {
+    env::var_os("CLAW_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claw")))
+        .unwrap_or_else(|| PathBuf::from(".claw"))
+        .join("config.json")
 }
 
 fn load_binary_startup_config(
@@ -2594,8 +2620,14 @@ struct GitWorkspaceSummary {
 }
 
 impl GitWorkspaceSummary {
+    const LARGE_WORKSPACE_THRESHOLD: usize = 500;
+
     fn is_clean(self) -> bool {
         self.changed_files == 0
+    }
+
+    fn is_large(self) -> bool {
+        self.changed_files >= Self::LARGE_WORKSPACE_THRESHOLD
     }
 
     fn headline(self) -> String {
@@ -2615,11 +2647,15 @@ impl GitWorkspaceSummary {
             if self.conflicted_files > 0 {
                 details.push(format!("{} conflicted", self.conflicted_files));
             }
-            format!(
+            let mut headline = format!(
                 "dirty · {} files · {}",
                 self.changed_files,
                 details.join(", ")
-            )
+            );
+            if self.is_large() {
+                headline.push_str(" · summarized");
+            }
+            headline
         }
     }
 }
@@ -2746,7 +2782,7 @@ fn render_resume_usage() -> String {
     format!(
         "Resume
   Usage            /resume <session-path|session-id|{LATEST_SESSION_REFERENCE}>
-  Auto-save        .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}
+  Auto-save        ~/.claw/sessions/<workspace-hash>/<session-id>.{PRIMARY_SESSION_EXTENSION}
   Tip              use /session list to inspect saved sessions"
     )
 }
@@ -3905,7 +3941,7 @@ impl LiveCli {
         permission_mode: PermissionMode,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(&model)?;
-        let session_state = Session::new();
+        let session_state = new_workspace_session()?;
         let session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(session.path.clone()),
@@ -4490,7 +4526,7 @@ impl LiveCli {
         }
 
         let previous_session = self.session.clone();
-        let session_state = Session::new();
+        let session_state = new_workspace_session()?;
         self.session = create_managed_session_handle(&session_state.session_id)?;
         let runtime = build_runtime(
             session_state.with_persistence_path(self.session.path.clone()),
@@ -4722,7 +4758,9 @@ impl LiveCli {
                     .fork
                     .as_ref()
                     .and_then(|fork| fork.branch_name.clone());
-                let forked = forked.with_persistence_path(handle.path.clone());
+                let forked = forked
+                    .with_workspace_root(current_workspace_root()?)
+                    .with_persistence_path(handle.path.clone());
                 let message_count = forked.messages.len();
                 forked.save_to_path(&handle.path)?;
                 let runtime = build_runtime(
@@ -4954,6 +4992,17 @@ fn sessions_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(store.sessions_dir().to_path_buf())
 }
 
+fn current_workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let store = runtime::SessionStore::from_cwd(&cwd)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    Ok(store.workspace_root().to_path_buf())
+}
+
+fn new_workspace_session() -> Result<Session, Box<dyn std::error::Error>> {
+    Ok(Session::new().with_workspace_root(current_workspace_root()?))
+}
+
 fn create_managed_session_handle(
     session_id: &str,
 ) -> Result<SessionHandle, Box<dyn std::error::Error>> {
@@ -4996,24 +5045,9 @@ fn resolve_session_reference(reference: &str) -> Result<SessionHandle, Box<dyn s
 }
 
 fn resolve_managed_session_path(session_id: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let directory = sessions_dir()?;
-    for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-        let path = directory.join(format!("{session_id}.{extension}"));
-        if path.exists() {
-            return Ok(path);
-        }
-    }
-    // Backward compatibility: pre-isolation sessions were stored at
-    // `.claw/sessions/<id>.{jsonl,json}` without the per-workspace hash
-    // subdirectory. Walk up from `directory` to the `.claw/sessions/` root
-    // and try the flat layout as a fallback so users do not lose access
-    // to their pre-upgrade managed sessions.
-    if let Some(legacy_root) = directory
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
+    for directory in session_read_dirs()? {
         for extension in [PRIMARY_SESSION_EXTENSION, LEGACY_SESSION_EXTENSION] {
-            let path = legacy_root.join(format!("{session_id}.{extension}"));
+            let path = directory.join(format!("{session_id}.{extension}"));
             if path.exists() {
                 return Ok(path);
             }
@@ -5090,19 +5124,38 @@ fn collect_sessions_from_dir(
     Ok(())
 }
 
+fn session_read_dirs() -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let cwd = env::current_dir()?;
+    let store = runtime::SessionStore::from_cwd(&cwd)
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
+    let workspace_root = store.workspace_root().to_path_buf();
+    let cwd = cwd.canonicalize().unwrap_or(cwd);
+    let workspace_root = workspace_root
+        .canonicalize()
+        .unwrap_or(workspace_root.clone());
+    let mut dirs = vec![store.sessions_dir().to_path_buf()];
+    for root in [&cwd, &workspace_root] {
+        push_unique_path(
+            &mut dirs,
+            root.join(".claw")
+                .join("sessions")
+                .join(runtime::workspace_fingerprint(root)),
+        );
+        push_unique_path(&mut dirs, root.join(".claw").join("sessions"));
+    }
+    Ok(dirs)
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, path: PathBuf) {
+    if !paths.iter().any(|existing| existing == &path) {
+        paths.push(path);
+    }
+}
+
 fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::error::Error>> {
     let mut sessions = Vec::new();
-    let primary_dir = sessions_dir()?;
-    collect_sessions_from_dir(&primary_dir, &mut sessions)?;
-
-    // Backward compatibility: include sessions stored in the pre-isolation
-    // flat `.claw/sessions/` root so users do not lose access to existing
-    // managed sessions after the workspace-hashed subdirectory rollout.
-    if let Some(legacy_root) = primary_dir
-        .parent()
-        .filter(|parent| parent.file_name().is_some_and(|name| name == "sessions"))
-    {
-        collect_sessions_from_dir(legacy_root, &mut sessions)?;
+    for directory in session_read_dirs()? {
+        collect_sessions_from_dir(&directory, &mut sessions)?;
     }
 
     sessions.sort_by(|left, right| {
@@ -5111,6 +5164,7 @@ fn list_managed_sessions() -> Result<Vec<ManagedSessionSummary>, Box<dyn std::er
             .cmp(&left.modified_epoch_millis)
             .then_with(|| right.id.cmp(&left.id))
     });
+    sessions.dedup_by(|left, right| left.id == right.id && left.path == right.path);
     Ok(sessions)
 }
 
@@ -5141,13 +5195,13 @@ fn confirm_session_deletion(session_id: &str) -> bool {
 
 fn format_missing_session_reference(reference: &str) -> String {
     format!(
-        "session not found: {reference}\nHint: managed sessions live in .claw/sessions/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
+        "session not found: {reference}\nHint: managed sessions live in ~/.claw/sessions/<workspace-hash>/. Try `{LATEST_SESSION_REFERENCE}` for the most recent session or `/session list` in the REPL."
     )
 }
 
 fn format_no_managed_sessions() -> String {
     format!(
-        "no managed sessions found in .claw/sessions/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
+        "no managed sessions found in ~/.claw/sessions/<workspace-hash>/\nStart `claw` to create a session, then rerun with `--resume {LATEST_SESSION_REFERENCE}`."
     )
 }
 
@@ -5239,7 +5293,7 @@ fn render_repl_help() -> String {
         "  Tab                  Complete commands, modes, and recent sessions".to_string(),
         "  Ctrl-C               Clear input (or exit on empty prompt)".to_string(),
         "  Shift+Enter/Ctrl+J   Insert a newline".to_string(),
-        "  Auto-save            .claw/sessions/<session-id>.jsonl".to_string(),
+        "  Auto-save            ~/.claw/sessions/<workspace-hash>/<session-id>.jsonl".to_string(),
         "  Resume latest        /resume latest".to_string(),
         "  Browse sessions      /session list".to_string(),
         "  Show prompt history  /history [count]".to_string(),
@@ -5314,7 +5368,8 @@ fn status_json_value(
             "session": context.session_path.as_ref().map_or_else(|| "live-repl".to_string(), |path| path.display().to_string()),
             "session_id": context.session_path.as_ref().and_then(|path| {
                 // Session files are named <session-id>.jsonl directly under
-                // .claw/sessions/. Extract the stem (drop the .jsonl extension).
+                // ~/.claw/sessions/<workspace-hash>/. Extract the stem (drop
+                // the .jsonl extension).
                 path.file_stem().map(|n| n.to_string_lossy().into_owned())
             }),
             "loaded_config_files": context.loaded_config_files,
@@ -5782,81 +5837,6 @@ fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
 
 fn render_diff_report() -> Result<String, Box<dyn std::error::Error>> {
     render_diff_report_for(&env::current_dir()?)
-}
-
-fn render_diff_report_for(cwd: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    // Verify we are inside a git repository before calling `git diff`.
-    // Running `git diff --cached` outside a git tree produces a misleading
-    // "unknown option `cached`" error because git falls back to --no-index mode.
-    let in_git_repo = std::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !in_git_repo {
-        return Ok(format!(
-            "Diff\n  Result           no git repository\n  Detail           {} is not inside a git project",
-            cwd.display()
-        ));
-    }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
-    if staged.trim().is_empty() && unstaged.trim().is_empty() {
-        return Ok(
-            "Diff\n  Result           clean working tree\n  Detail           no current changes"
-                .to_string(),
-        );
-    }
-
-    let mut sections = Vec::new();
-    if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
-    }
-    if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
-    }
-
-    Ok(format!("Diff\n\n{}", sections.join("\n\n")))
-}
-
-fn render_diff_json_for(cwd: &Path) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
-    let in_git_repo = std::process::Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(cwd)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if !in_git_repo {
-        return Ok(serde_json::json!({
-            "kind": "diff",
-            "result": "no_git_repo",
-            "detail": format!("{} is not inside a git project", cwd.display()),
-        }));
-    }
-    let staged = run_git_diff_command_in(cwd, &["diff", "--cached"])?;
-    let unstaged = run_git_diff_command_in(cwd, &["diff"])?;
-    Ok(serde_json::json!({
-        "kind": "diff",
-        "result": if staged.trim().is_empty() && unstaged.trim().is_empty() { "clean" } else { "changes" },
-        "staged": staged.trim(),
-        "unstaged": unstaged.trim(),
-    }))
-}
-
-fn run_git_diff_command_in(
-    cwd: &Path,
-    args: &[&str],
-) -> Result<String, Box<dyn std::error::Error>> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("git {} failed: {stderr}", args.join(" ")).into());
-    }
-    Ok(String::from_utf8(output.stdout)?)
 }
 
 fn render_teleport_report(target: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -7079,6 +7059,7 @@ struct AnthropicRuntimeClient {
     tool_registry: GlobalToolRegistry,
     progress_reporter: Option<InternalPromptProgressReporter>,
     reasoning_effort: Option<String>,
+    model_capability_override: Option<ModelCapability>,
 }
 
 impl AnthropicRuntimeClient {
@@ -7133,6 +7114,7 @@ impl AnthropicRuntimeClient {
                 ApiProviderClient::from_model_with_anthropic_auth(&resolved_model, None)?
             }
         };
+        let model_capability_override = config_model_capability_for_current_dir(&model);
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
             client,
@@ -7144,6 +7126,7 @@ impl AnthropicRuntimeClient {
             tool_registry,
             progress_reporter,
             reasoning_effort: None,
+            model_capability_override,
         })
     }
 
@@ -7187,7 +7170,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let is_post_tool = request_ends_with_tool_result(&request);
         let message_request = MessageRequest {
             model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
+            max_tokens: 1,
             messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self
@@ -7196,7 +7179,12 @@ impl ApiClient for AnthropicRuntimeClient {
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
             reasoning_effort: self.reasoning_effort.clone(),
+            model_capability_override: self.model_capability_override,
             ..Default::default()
+        };
+        let message_request = MessageRequest {
+            max_tokens: dynamic_max_tokens_for_request(&message_request),
+            ..message_request
         };
 
         self.runtime.block_on(async {
@@ -7446,6 +7434,7 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
             requested_output_tokens,
             estimated_total_tokens,
             context_window_tokens,
+            max_prompt_tokens,
         } => {
             lines.push(format!("  Model            {model}"));
             lines.push(format!(
@@ -7458,6 +7447,9 @@ fn format_context_window_blocked_error(session_id: &str, error: &api::ApiError) 
                 "  Total estimate   ~{estimated_total_tokens} tokens (heuristic)"
             ));
             lines.push(format!("  Context window   {context_window_tokens} tokens"));
+            if let Some(max_prompt_tokens) = max_prompt_tokens {
+                lines.push(format!("  Max prompt       {max_prompt_tokens} tokens"));
+            }
         }
         api::ApiError::Api { message, body, .. } => {
             let detail = message.as_deref().unwrap_or(body).trim();
@@ -8462,44 +8454,44 @@ fn permission_policy(
 }
 
 fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
-    messages
+    let runtime_messages = messages
         .iter()
-        .filter_map(|message| {
+        .map(|message| {
             let role = match message.role {
-                MessageRole::System | MessageRole::User | MessageRole::Tool => "user",
-                MessageRole::Assistant => "assistant",
+                MessageRole::System => ApiRuntimeMessageRole::System,
+                MessageRole::User => ApiRuntimeMessageRole::User,
+                MessageRole::Assistant => ApiRuntimeMessageRole::Assistant,
+                MessageRole::Tool => ApiRuntimeMessageRole::Tool,
             };
-            let content = message
+            let blocks = message
                 .blocks
                 .iter()
                 .map(|block| match block {
-                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
-                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                    ContentBlock::Text { text } => ApiRuntimeContentBlock::Text {
+                        text: text.clone(),
+                    },
+                    ContentBlock::ToolUse { id, name, input } => ApiRuntimeContentBlock::ToolUse {
                         id: id.clone(),
                         name: name.clone(),
-                        input: serde_json::from_str(input)
-                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                        input: input.clone(),
                     },
                     ContentBlock::ToolResult {
                         tool_use_id,
+                        tool_name,
                         output,
                         is_error,
-                        ..
-                    } => InputContentBlock::ToolResult {
+                    } => ApiRuntimeContentBlock::ToolResult {
                         tool_use_id: tool_use_id.clone(),
-                        content: vec![ToolResultContentBlock::Text {
-                            text: output.clone(),
-                        }],
+                        tool_name: tool_name.clone(),
+                        output: output.clone(),
                         is_error: *is_error,
                     },
                 })
                 .collect::<Vec<_>>();
-            (!content.is_empty()).then(|| InputMessage {
-                role: role.to_string(),
-                content,
-            })
+            ApiRuntimeConversationMessage { role, blocks }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    runtime_messages_to_input_messages(&runtime_messages)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -8607,7 +8599,7 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Session shortcuts:")?;
     writeln!(
         out,
-        "  REPL turns auto-save to .claw/sessions/<session-id>.{PRIMARY_SESSION_EXTENSION}"
+        "  REPL turns auto-save to ~/.claw/sessions/<workspace-hash>/<session-id>.{PRIMARY_SESSION_EXTENSION}"
     )?;
     writeln!(
         out,
@@ -8782,6 +8774,7 @@ mod tests {
             requested_output_tokens: 64_000,
             estimated_total_tokens: 246_000,
             context_window_tokens: 200_000,
+            max_prompt_tokens: None,
         };
 
         let rendered = format_user_visible_api_error("session-issue-32", &error);
@@ -10319,7 +10312,9 @@ mod tests {
         assert!(help.contains("/agents"));
         assert!(help.contains("/skills"));
         assert!(help.contains("/exit"));
-        assert!(help.contains("Auto-save            .claw/sessions/<session-id>.jsonl"));
+        assert!(help.contains(
+            "Auto-save            ~/.claw/sessions/<workspace-hash>/<session-id>.jsonl"
+        ));
         assert!(help.contains("Resume latest        /resume latest"));
     }
 
@@ -10543,6 +10538,23 @@ mod tests {
         );
         assert!(!candidates.iter().any(|path| path
             == &PathBuf::from("/tmp/claw-build/target/debug/claw/.claw/config.json")));
+    }
+
+    #[test]
+    fn binary_startup_config_candidates_prefer_user_config_home() {
+        let _guard = env_lock();
+        let root = temp_dir();
+        let config_home = root.join("home").join(".claw");
+        fs::create_dir_all(&config_home).expect("config home");
+        std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var(BINARY_STARTUP_CONFIG_ENV);
+
+        let candidates = binary_startup_config_candidates();
+
+        assert_eq!(candidates.first(), Some(&config_home.join("config.json")));
+
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
@@ -11123,7 +11135,7 @@ UU conflicted.rs",
     fn resume_usage_mentions_latest_shortcut() {
         let usage = render_resume_usage();
         assert!(usage.contains("/resume <session-path|session-id|latest>"));
-        assert!(usage.contains(".claw/sessions/<session-id>.jsonl"));
+        assert!(usage.contains("~/.claw/sessions/<workspace-hash>/<session-id>.jsonl"));
         assert!(usage.contains("/session list"));
     }
 

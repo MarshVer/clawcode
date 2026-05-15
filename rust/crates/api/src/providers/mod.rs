@@ -2,6 +2,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use claw_core::{ContextBudget, ModelCapability};
 use serde::Serialize;
 
 use crate::error::ApiError;
@@ -47,6 +48,7 @@ pub struct ProviderMetadata {
 pub struct ModelTokenLimit {
     pub max_output_tokens: u32,
     pub context_window_tokens: u32,
+    pub max_prompt_tokens: Option<u32>,
 }
 
 const MODEL_REGISTRY: &[(&str, ProviderMetadata)] = &[
@@ -234,9 +236,9 @@ pub fn max_tokens_for_model(model: &str) -> u32 {
         || {
             let canonical = resolve_model_alias(model);
             if canonical.contains("opus") {
-                32_000
+                16_000
             } else {
-                64_000
+                32_000
             }
         },
         |limit| limit.max_output_tokens,
@@ -258,45 +260,159 @@ pub fn model_token_limit(model: &str) -> Option<ModelTokenLimit> {
         "claude-opus-4-6" => Some(ModelTokenLimit {
             max_output_tokens: 32_000,
             context_window_tokens: 200_000,
+            max_prompt_tokens: None,
         }),
         "claude-sonnet-4-6" | "claude-haiku-4-5-20251213" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 200_000,
+            max_prompt_tokens: None,
         }),
         "grok-3" | "grok-3-mini" => Some(ModelTokenLimit {
             max_output_tokens: 64_000,
             context_window_tokens: 131_072,
+            max_prompt_tokens: None,
         }),
+        // Conservative defaults for common OpenAI-compatible endpoints whose
+        // server-side limit is often lower than the model's advertised window.
+        "minimax-m2.5" | "minimaxai/minimax-m2.5" | "minimax/minimax-m2.5" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 64_000,
+                context_window_tokens: 196_608,
+                max_prompt_tokens: Some(196_608),
+            })
+        }
+        "openai/gpt-4.1" | "gpt-4.1" | "openai/gpt-4.1-mini" | "gpt-4.1-mini" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 32_768,
+                context_window_tokens: 1_047_576,
+                max_prompt_tokens: None,
+            })
+        }
+        "openai/gpt-5" | "gpt-5" | "openai/gpt-5.2" | "gpt-5.2" => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 128_000,
+                context_window_tokens: 400_000,
+                max_prompt_tokens: None,
+            })
+        }
+        other if other.starts_with("qwen") || other.starts_with("qwen/") => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 32_000,
+                context_window_tokens: 131_072,
+                max_prompt_tokens: None,
+            })
+        }
+        other if other.starts_with("openai/") || other.starts_with("gpt-") => {
+            Some(ModelTokenLimit {
+                max_output_tokens: 32_000,
+                context_window_tokens: 128_000,
+                max_prompt_tokens: None,
+            })
+        }
         _ => None,
     }
 }
 
 pub fn preflight_message_request(request: &MessageRequest) -> Result<(), ApiError> {
-    let Some(limit) = model_token_limit(&request.model) else {
+    let Some(limit) = model_token_limit_for_request(request) else {
         return Ok(());
     };
 
-    let estimated_input_tokens = estimate_message_request_input_tokens(request);
-    let estimated_total_tokens = estimated_input_tokens.saturating_add(request.max_tokens);
+    let budget = context_budget_for_request_with_requested(request, request.max_tokens);
+    let estimated_total_tokens = budget
+        .estimated_input_tokens
+        .saturating_add(budget.requested_output_tokens);
     if estimated_total_tokens > limit.context_window_tokens {
         return Err(ApiError::ContextWindowExceeded {
             model: resolve_model_alias(&request.model),
-            estimated_input_tokens,
-            requested_output_tokens: request.max_tokens,
+            estimated_input_tokens: budget.estimated_input_tokens,
+            requested_output_tokens: budget.requested_output_tokens,
             estimated_total_tokens,
             context_window_tokens: limit.context_window_tokens,
+            max_prompt_tokens: limit.max_prompt_tokens,
         });
+    }
+    if let Some(max_prompt_tokens) = limit.max_prompt_tokens {
+        if budget.estimated_input_tokens > max_prompt_tokens {
+            return Err(ApiError::ContextWindowExceeded {
+                model: resolve_model_alias(&request.model),
+                estimated_input_tokens: budget.estimated_input_tokens,
+                requested_output_tokens: budget.requested_output_tokens,
+                estimated_total_tokens,
+                context_window_tokens: limit.context_window_tokens,
+                max_prompt_tokens: Some(max_prompt_tokens),
+            });
+        }
     }
 
     Ok(())
 }
 
-fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
+#[must_use]
+pub fn estimate_message_request_input_tokens(request: &MessageRequest) -> u32 {
     let mut estimate = estimate_serialized_tokens(&request.messages);
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.system));
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tools));
     estimate = estimate.saturating_add(estimate_serialized_tokens(&request.tool_choice));
     estimate
+}
+
+#[must_use]
+pub fn dynamic_max_tokens_for_request(request: &MessageRequest) -> u32 {
+    let requested = model_token_limit_for_request(request).map_or_else(
+        || max_tokens_for_model(&request.model),
+        |limit| limit.max_output_tokens,
+    );
+    dynamic_max_tokens_for_request_with_requested(request, requested)
+}
+
+#[must_use]
+pub fn dynamic_max_tokens_for_request_with_requested(
+    request: &MessageRequest,
+    requested: u32,
+) -> u32 {
+    context_budget_for_request_with_requested(request, requested).max_output_tokens
+}
+
+#[must_use]
+pub fn context_budget_for_request(request: &MessageRequest) -> ContextBudget {
+    let requested = model_token_limit_for_request(request).map_or_else(
+        || max_tokens_for_model(&request.model),
+        |limit| limit.max_output_tokens,
+    );
+    context_budget_for_request_with_requested(request, requested)
+}
+
+#[must_use]
+pub fn context_budget_for_request_with_requested(
+    request: &MessageRequest,
+    requested: u32,
+) -> ContextBudget {
+    let limit = model_token_limit_for_request(request);
+    ContextBudget::bounded_output_tokens(
+        estimate_message_request_input_tokens(request),
+        requested,
+        limit.map_or(32_000, |limit| limit.max_output_tokens),
+        limit.map(|limit| limit.context_window_tokens),
+    )
+}
+
+#[must_use]
+pub fn model_token_limit_for_request(request: &MessageRequest) -> Option<ModelTokenLimit> {
+    request
+        .model_capability_override
+        .map(ModelTokenLimit::from)
+        .or_else(|| model_token_limit(&request.model))
+}
+
+impl From<ModelCapability> for ModelTokenLimit {
+    fn from(value: ModelCapability) -> Self {
+        Self {
+            max_output_tokens: value.max_output_tokens,
+            context_window_tokens: value.context_window_tokens,
+            max_prompt_tokens: value.max_prompt_tokens,
+        }
+    }
 }
 
 fn estimate_serialized_tokens<T: Serialize>(value: &T) -> u32 {
@@ -556,7 +672,8 @@ mod tests {
 
     #[test]
     fn keeps_existing_max_token_heuristic() {
-        assert_eq!(max_tokens_for_model("opus"), 32_000);
+        assert_eq!(max_tokens_for_model("opus"), 16_000);
+        assert_eq!(max_tokens_for_model("unknown-sonnet-like"), 32_000);
         assert_eq!(max_tokens_for_model("grok-3"), 64_000);
     }
 
@@ -627,6 +744,26 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_budget_uses_request_model_capability_override() {
+        let request = MessageRequest {
+            model: "custom-provider/custom-model".to_string(),
+            max_tokens: 1,
+            messages: vec![InputMessage::user_text("hello")],
+            model_capability_override: Some(ModelCapability {
+                max_output_tokens: 64_000,
+                context_window_tokens: 196_608,
+                max_prompt_tokens: Some(196_608),
+            }),
+            ..Default::default()
+        };
+
+        let budget = context_budget_for_request(&request);
+
+        assert_eq!(budget.max_output_tokens, 64_000);
+        assert_eq!(budget.context_window_tokens, Some(196_608));
+    }
+
+    #[test]
     fn preflight_blocks_requests_that_exceed_the_model_context_window() {
         let request = MessageRequest {
             model: "claude-sonnet-4-6".to_string(),
@@ -661,12 +798,14 @@ mod tests {
                 requested_output_tokens,
                 estimated_total_tokens,
                 context_window_tokens,
+                max_prompt_tokens,
             } => {
                 assert_eq!(model, "claude-sonnet-4-6");
                 assert!(estimated_input_tokens > 136_000);
                 assert_eq!(requested_output_tokens, 64_000);
                 assert!(estimated_total_tokens > context_window_tokens);
                 assert_eq!(context_window_tokens, 200_000);
+                assert_eq!(max_prompt_tokens, None);
             }
             other => panic!("expected context-window preflight failure, got {other:?}"),
         }

@@ -20,7 +20,7 @@ cd rust
 cargo build --workspace
 
 6. 配置大模型环境变量
-./rust/.claw/config.json 配置参数
+~/.claw/config.json 配置参数
 
 7. 启动clawcode
 任务位置执行 claw

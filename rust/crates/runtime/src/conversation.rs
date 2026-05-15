@@ -16,6 +16,7 @@ use crate::session::{ContentBlock, ConversationMessage, Session};
 use crate::usage::{TokenUsage, UsageTracker};
 
 const DEFAULT_AUTO_COMPACTION_INPUT_TOKENS_THRESHOLD: u32 = 100_000;
+const DEFAULT_PRE_REQUEST_COMPACTION_ESTIMATED_TOKENS: usize = 48_000;
 const AUTO_COMPACTION_THRESHOLD_ENV_VAR: &str = "CLAUDE_CODE_AUTO_COMPACT_INPUT_TOKENS";
 
 /// Fully assembled request payload sent to the upstream model client.
@@ -319,9 +320,11 @@ where
                 return Err(error);
             }
 
+            self.maybe_pre_request_compact()?;
+
             let request = ApiRequest {
                 system_prompt: self.system_prompt.clone(),
-                messages: self.session.messages.clone(),
+                messages: self.session.sanitized_messages_for_request(),
             };
             let events = match self.api_client.stream(request) {
                 Ok(events) => events,
@@ -545,6 +548,33 @@ where
         Some(AutoCompactionEvent {
             removed_message_count: result.removed_message_count,
         })
+    }
+
+    fn maybe_pre_request_compact(&mut self) -> Result<(), RuntimeError> {
+        if estimate_session_tokens(&self.session) < DEFAULT_PRE_REQUEST_COMPACTION_ESTIMATED_TOKENS {
+            return Ok(());
+        }
+
+        let result = compact_session(
+            &self.session,
+            CompactionConfig {
+                max_estimated_tokens: DEFAULT_PRE_REQUEST_COMPACTION_ESTIMATED_TOKENS,
+                ..CompactionConfig::default()
+            },
+        );
+
+        if result.removed_message_count == 0 {
+            return Ok(());
+        }
+
+        let compacted = result.compacted_session;
+        if let Some(path) = compacted.persistence_path().map(std::path::Path::to_path_buf) {
+            compacted
+                .save_to_path(path)
+                .map_err(|error| RuntimeError::new(error.to_string()))?;
+        }
+        self.session = compacted;
+        Ok(())
     }
 
     fn record_turn_started(&self, user_input: &str) {

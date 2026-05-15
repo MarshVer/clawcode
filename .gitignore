@@ -1,0 +1,23 @@
+rust/target/
+target/
+rust/vendor/
+intranet-packages/
+
+# Local agent/session state
+.claw/
+**/.claw/sessions/
+**/.claw/*.local.json
+**/.claw/settings.local.json
+.codex/
+.agents/
+
+# Sandboxed command homes and temp dirs
+.sandbox-home/
+.sandbox-tmp/
+**/.sandbox-home/
+**/.sandbox-tmp/
+
+# Common editor/OS noise
+.DS_Store
+*.swp
+*.swo

@@ -1,5 +1,15 @@
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
+
+const DEFAULT_STARTUP_CONFIG_JSON: &str = r#"{
+  "provider": "openai",
+  "model": "deepseek-ai/DeepSeek-V3.2",
+  "url": "https://api.siliconflow.cn/v1",
+  "key": ""
+}
+"#;
 
 fn main() {
     // Get git SHA (short hash)
@@ -56,4 +66,36 @@ fn main() {
     // Rerun if git state changes
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/refs");
+
+    install_user_startup_config();
+}
+
+fn install_user_startup_config() {
+    let target = user_config_home().join("config.json");
+    if target.exists() {
+        return;
+    }
+    if let Some(parent) = target.parent() {
+        if let Err(error) = fs::create_dir_all(parent) {
+            println!(
+                "cargo:warning=failed to create user claw config directory {}: {error}",
+                parent.display()
+            );
+            return;
+        }
+    }
+    if let Err(error) = fs::write(&target, DEFAULT_STARTUP_CONFIG_JSON) {
+        println!(
+            "cargo:warning=failed to write default startup config to {}: {error}",
+            target.display()
+        );
+    }
+}
+
+fn user_config_home() -> PathBuf {
+    env::var_os("CLAW_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".claw")))
+        .or_else(|| env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".claw")))
+        .unwrap_or_else(|| PathBuf::from(".claw"))
 }

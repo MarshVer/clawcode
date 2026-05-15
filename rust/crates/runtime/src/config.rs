@@ -3,6 +3,9 @@ use std::fmt::{Display, Formatter};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+pub use claw_core::OAuthConfig;
+use claw_core::ModelCapability;
+
 use crate::json::JsonValue;
 use crate::sandbox::{FilesystemIsolationMode, SandboxConfig};
 
@@ -64,6 +67,7 @@ pub struct RuntimeFeatureConfig {
     permission_rules: RuntimePermissionRuleConfig,
     sandbox: SandboxConfig,
     provider_fallbacks: ProviderFallbackConfig,
+    model_capabilities: BTreeMap<String, ModelCapability>,
     trusted_roots: Vec<String>,
 }
 
@@ -173,17 +177,6 @@ pub struct McpOAuthConfig {
     pub callback_port: Option<u16>,
     pub auth_server_metadata_url: Option<String>,
     pub xaa: Option<bool>,
-}
-
-/// OAuth client configuration used by the main Claw runtime.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OAuthConfig {
-    pub client_id: String,
-    pub authorize_url: String,
-    pub token_url: String,
-    pub callback_port: Option<u16>,
-    pub manual_redirect_url: Option<String>,
-    pub scopes: Vec<String>,
 }
 
 /// Errors raised while reading or parsing runtime configuration files.
@@ -314,6 +307,7 @@ impl ConfigLoader {
             permission_rules: parse_optional_permission_rules(&merged_value)?,
             sandbox: parse_optional_sandbox_config(&merged_value)?,
             provider_fallbacks: parse_optional_provider_fallbacks(&merged_value)?,
+            model_capabilities: parse_optional_model_capabilities(&merged_value)?,
             trusted_roots: parse_optional_trusted_roots(&merged_value)?,
         };
 
@@ -411,6 +405,11 @@ impl RuntimeConfig {
     }
 
     #[must_use]
+    pub fn model_capabilities(&self) -> &BTreeMap<String, ModelCapability> {
+        &self.feature_config.model_capabilities
+    }
+
+    #[must_use]
     pub fn trusted_roots(&self) -> &[String] {
         &self.feature_config.trusted_roots
     }
@@ -477,6 +476,11 @@ impl RuntimeFeatureConfig {
     #[must_use]
     pub fn provider_fallbacks(&self) -> &ProviderFallbackConfig {
         &self.provider_fallbacks
+    }
+
+    #[must_use]
+    pub fn model_capabilities(&self) -> &BTreeMap<String, ModelCapability> {
+        &self.model_capabilities
     }
 
     #[must_use]
@@ -904,6 +908,53 @@ fn parse_optional_provider_fallbacks(
     Ok(ProviderFallbackConfig { primary, fallbacks })
 }
 
+fn parse_optional_model_capabilities(
+    root: &JsonValue,
+) -> Result<BTreeMap<String, ModelCapability>, ConfigError> {
+    let Some(object) = root.as_object() else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(value) = object
+        .get("modelCapabilities")
+        .or_else(|| object.get("models"))
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = expect_object(value, "merged settings.modelCapabilities")?;
+    let mut capabilities = BTreeMap::new();
+    for (model, value) in entries {
+        let entry = expect_object(
+            value,
+            &format!("merged settings.modelCapabilities.{model}"),
+        )?;
+        let context_window_tokens = required_u32(
+            entry,
+            "contextWindowTokens",
+            &format!("merged settings.modelCapabilities.{model}"),
+        )?;
+        let max_output_tokens = optional_positive_u32(
+            entry,
+            "maxOutputTokens",
+            &format!("merged settings.modelCapabilities.{model}"),
+        )?
+        .unwrap_or(32_000);
+        let max_prompt_tokens = optional_positive_u32(
+            entry,
+            "maxPromptTokens",
+            &format!("merged settings.modelCapabilities.{model}"),
+        )?;
+        capabilities.insert(
+            model.to_ascii_lowercase(),
+            ModelCapability {
+                max_output_tokens,
+                context_window_tokens,
+                max_prompt_tokens,
+            },
+        );
+    }
+    Ok(capabilities)
+}
+
 fn parse_optional_trusted_roots(root: &JsonValue) -> Result<Vec<String>, ConfigError> {
     let Some(object) = root.as_object() else {
         return Ok(Vec::new());
@@ -1114,6 +1165,32 @@ fn optional_u32(
         }
         None => Ok(None),
     }
+}
+
+fn optional_positive_u32(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<Option<u32>, ConfigError> {
+    optional_u32(object, key, context)?.map_or(Ok(None), |number| {
+        if number == 0 {
+            Err(ConfigError::Parse(format!(
+                "{context}: field {key} must be a positive integer"
+            )))
+        } else {
+            Ok(Some(number))
+        }
+    })
+}
+
+fn required_u32(
+    object: &BTreeMap<String, JsonValue>,
+    key: &str,
+    context: &str,
+) -> Result<u32, ConfigError> {
+    optional_positive_u32(object, key, context)?.ok_or_else(|| {
+        ConfigError::Parse(format!("{context}.{key} must be a positive integer"))
+    })
 }
 
 fn optional_u64(

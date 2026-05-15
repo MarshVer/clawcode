@@ -27,6 +27,7 @@ const MCP_INITIALIZE_TIMEOUT_MS: u64 = 10_000;
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 300;
 #[cfg(not(test))]
 const MCP_LIST_TOOLS_TIMEOUT_MS: u64 = 30_000;
+const MAX_MCP_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(untagged)]
@@ -1241,6 +1242,14 @@ impl McpStdioProcess {
         let content_length = content_length.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header")
         })?;
+        if content_length > MAX_MCP_FRAME_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "MCP frame is too large ({content_length} bytes, max {MAX_MCP_FRAME_BYTES} bytes)"
+                ),
+            ));
+        }
         let mut payload = vec![0_u8; content_length];
         self.stdout.read_exact(&mut payload).await?;
         Ok(payload)

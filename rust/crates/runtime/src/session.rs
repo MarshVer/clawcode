@@ -1,17 +1,24 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use claw_core::{
+    validate_tool_result_pairing, SharedContentBlock, SharedConversationMessage,
+    SharedMessageRole, ToolPairingIssue,
+};
+use fd_lock::RwLock;
 
 use crate::json::{JsonError, JsonValue};
 use crate::usage::TokenUsage;
 
 const SESSION_VERSION: u32 = 1;
-const ROTATE_AFTER_BYTES: u64 = 256 * 1024;
-const MAX_ROTATED_FILES: usize = 3;
+const ROTATE_AFTER_BYTES: u64 = 1_024 * 1_024;
+const MAX_ROTATED_FILES: usize = 2;
+const SESSION_LOCK_EXTENSION: &str = "lock";
 static SESSION_ID_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Speaker role associated with a persisted conversation message.
@@ -198,26 +205,18 @@ impl Session {
 
     pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), SessionError> {
         let path = path.as_ref();
-        let snapshot = self.render_jsonl_snapshot()?;
-        rotate_session_file_if_needed(path)?;
-        write_atomic(path, &snapshot)?;
-        cleanup_rotated_logs(path)?;
-        Ok(())
+        with_session_file_lock(path, || {
+            let snapshot = self.render_jsonl_snapshot()?;
+            rotate_session_file_if_needed(path)?;
+            write_atomic(path, &snapshot)?;
+            cleanup_rotated_logs(path)?;
+            Ok(())
+        })
     }
 
     pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, SessionError> {
         let path = path.as_ref();
-        let contents = fs::read_to_string(path)?;
-        let session = match JsonValue::parse(&contents) {
-            Ok(value)
-                if value
-                    .as_object()
-                    .is_some_and(|object| object.contains_key("messages")) =>
-            {
-                Self::from_json(&value)?
-            }
-            Err(_) | Ok(_) => Self::from_jsonl(&contents)?,
-        };
+        let session = load_session_file(path)?;
         Ok(session.with_persistence_path(path.to_path_buf()))
     }
 
@@ -239,6 +238,16 @@ impl Session {
 
     pub fn push_user_text(&mut self, text: impl Into<String>) -> Result<(), SessionError> {
         self.push_message(ConversationMessage::user_text(text))
+    }
+
+    #[must_use]
+    pub fn tool_pairing_issues(&self) -> Vec<ToolPairingIssue> {
+        validate_tool_result_pairing(&shared_messages_from_runtime(&self.messages))
+    }
+
+    #[must_use]
+    pub fn sanitized_messages_for_request(&self) -> Vec<ConversationMessage> {
+        sanitize_runtime_tool_pairing(&self.messages)
     }
 
     pub fn record_compaction(&mut self, summary: impl Into<String>, removed_message_count: usize) {
@@ -396,6 +405,13 @@ impl Session {
     }
 
     fn from_jsonl(contents: &str) -> Result<Self, SessionError> {
+        Self::from_jsonl_lines(contents.lines().map(|line| Ok(line.to_string())))
+    }
+
+    fn from_jsonl_lines<I>(lines: I) -> Result<Self, SessionError>
+    where
+        I: IntoIterator<Item = Result<String, SessionError>>,
+    {
         let mut version = SESSION_VERSION;
         let mut session_id = None;
         let mut created_at_ms = None;
@@ -407,7 +423,8 @@ impl Session {
         let mut model = None;
         let mut prompt_history = Vec::new();
 
-        for (line_number, raw_line) in contents.lines().enumerate() {
+        for (line_number, raw_line) in lines.into_iter().enumerate() {
+            let raw_line = raw_line?;
             let line = raw_line.trim();
             if line.is_empty() {
                 continue;
@@ -506,8 +523,15 @@ impl Session {
             text: text.into(),
         };
         self.prompt_history.push(entry);
-        let entry_ref = self.prompt_history.last().expect("entry was just pushed");
-        self.append_persisted_prompt_entry(entry_ref)
+        let persist_result = {
+            let entry_ref = self.prompt_history.last().expect("entry was just pushed");
+            self.append_persisted_prompt_entry(entry_ref)
+        };
+        if let Err(error) = persist_result {
+            self.prompt_history.pop();
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn render_jsonl_snapshot(&self) -> Result<String, SessionError> {
@@ -535,15 +559,20 @@ impl Session {
             return Ok(());
         };
 
-        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
-        if needs_bootstrap {
-            self.save_to_path(path)?;
-            return Ok(());
-        }
+        with_session_file_lock(path, || {
+            let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+            if needs_bootstrap {
+                let snapshot = self.render_jsonl_snapshot()?;
+                rotate_session_file_if_needed(path)?;
+                write_atomic(path, &snapshot)?;
+                cleanup_rotated_logs(path)?;
+                return Ok(());
+            }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "{}", message_record(message).render())?;
-        Ok(())
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            writeln!(file, "{}", message_record(message).render())?;
+            Ok(())
+        })
     }
 
     fn append_persisted_prompt_entry(
@@ -554,15 +583,20 @@ impl Session {
             return Ok(());
         };
 
-        let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
-        if needs_bootstrap {
-            self.save_to_path(path)?;
-            return Ok(());
-        }
+        with_session_file_lock(path, || {
+            let needs_bootstrap = !path.exists() || fs::metadata(path)?.len() == 0;
+            if needs_bootstrap {
+                let snapshot = self.render_jsonl_snapshot()?;
+                rotate_session_file_if_needed(path)?;
+                write_atomic(path, &snapshot)?;
+                cleanup_rotated_logs(path)?;
+                return Ok(());
+            }
 
-        let mut file = OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "{}", entry.to_jsonl_record().render())?;
-        Ok(())
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            writeln!(file, "{}", entry.to_jsonl_record().render())?;
+            Ok(())
+        })
     }
 
     fn meta_record(&self) -> Result<JsonValue, SessionError> {
@@ -793,6 +827,97 @@ impl ContentBlock {
                 "unsupported block type: {other}"
             ))),
         }
+    }
+}
+
+#[must_use]
+pub fn sanitize_runtime_tool_pairing(
+    messages: &[ConversationMessage],
+) -> Vec<ConversationMessage> {
+    let mut pending_tool_use_ids = BTreeSet::new();
+    let mut sanitized = Vec::with_capacity(messages.len());
+
+    for message in messages {
+        let mut blocks = Vec::with_capacity(message.blocks.len());
+        for block in &message.blocks {
+            match block {
+                ContentBlock::ToolUse { id, .. } if message.role == MessageRole::Assistant => {
+                    pending_tool_use_ids.insert(id.clone());
+                    blocks.push(block.clone());
+                }
+                ContentBlock::ToolResult { tool_use_id, .. } => {
+                    if pending_tool_use_ids.remove(tool_use_id) {
+                        blocks.push(block.clone());
+                    }
+                }
+                _ => blocks.push(block.clone()),
+            }
+        }
+
+        if !blocks
+            .iter()
+            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+            && !blocks
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolResult { .. }))
+        {
+            pending_tool_use_ids.clear();
+        }
+
+        if !blocks.is_empty() {
+            sanitized.push(ConversationMessage {
+                role: message.role,
+                blocks,
+                usage: message.usage,
+            });
+        }
+    }
+
+    sanitized
+}
+
+fn shared_messages_from_runtime(messages: &[ConversationMessage]) -> Vec<SharedConversationMessage> {
+    messages
+        .iter()
+        .map(|message| SharedConversationMessage {
+            role: runtime_role_to_shared(message.role),
+            blocks: message
+                .blocks
+                .iter()
+                .map(shared_block_from_runtime)
+                .collect(),
+        })
+        .collect()
+}
+
+fn runtime_role_to_shared(role: MessageRole) -> SharedMessageRole {
+    match role {
+        MessageRole::System => SharedMessageRole::System,
+        MessageRole::User => SharedMessageRole::User,
+        MessageRole::Assistant => SharedMessageRole::Assistant,
+        MessageRole::Tool => SharedMessageRole::Tool,
+    }
+}
+
+fn shared_block_from_runtime(block: &ContentBlock) -> SharedContentBlock {
+    match block {
+        ContentBlock::Text { text } => SharedContentBlock::Text { text: text.clone() },
+        ContentBlock::ToolUse { id, name, input } => SharedContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        ContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        } => SharedContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: tool_name.clone(),
+            output: output.clone(),
+            is_error: *is_error,
+        },
     }
 }
 
@@ -1033,6 +1158,83 @@ fn generate_session_id() -> String {
     let millis = current_time_millis();
     let counter = SESSION_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     format!("session-{millis}-{counter}")
+}
+
+fn with_session_file_lock<T>(
+    path: &Path,
+    operation: impl FnOnce() -> Result<T, SessionError>,
+) -> Result<T, SessionError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let lock_path = session_lock_path(path);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    let mut lock = RwLock::new(file);
+    let _guard = lock.write()?;
+    operation()
+}
+
+fn load_session_file(path: &Path) -> Result<Session, SessionError> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut first_line = String::new();
+    loop {
+        first_line.clear();
+        if reader.read_line(&mut first_line)? == 0 {
+            break;
+        }
+        if !first_line.trim().is_empty() {
+            break;
+        }
+    }
+    drop(reader);
+
+    if !first_line.trim().is_empty() {
+        let contents = fs::read_to_string(path)?;
+        if let Ok(value) = JsonValue::parse(&contents) {
+            if value
+                .as_object()
+                .is_some_and(|object| object.contains_key("messages"))
+            {
+                return Session::from_json(&value);
+            }
+        }
+        if first_jsonl_record_has_type(&first_line) {
+            return load_session_jsonl_streaming(path);
+        }
+        return Session::from_jsonl(&contents);
+    }
+
+    load_session_jsonl_streaming(path)
+}
+
+fn first_jsonl_record_has_type(line: &str) -> bool {
+    JsonValue::parse(line.trim())
+        .ok()
+        .and_then(|value| {
+            value
+                .as_object()
+                .map(|object| object.contains_key("type"))
+        })
+        .unwrap_or(false)
+}
+
+fn load_session_jsonl_streaming(path: &Path) -> Result<Session, SessionError> {
+    let file = OpenOptions::new().read(true).open(path)?;
+    let reader = BufReader::new(file);
+    Session::from_jsonl_lines(reader.lines().map(|line| line.map_err(SessionError::Io)))
+}
+
+fn session_lock_path(path: &Path) -> PathBuf {
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("session");
+    path.with_file_name(format!("{file_name}.{SESSION_LOCK_EXTENSION}"))
 }
 
 fn write_atomic(path: &Path, contents: &str) -> Result<(), SessionError> {
@@ -1473,10 +1675,43 @@ pub fn workspace_sessions_dir(cwd: &std::path::Path) -> Result<std::path::PathBu
 mod workspace_sessions_dir_tests {
     use super::*;
     use std::fs;
+    use std::path::{Path, PathBuf};
+
+    struct ConfigHomeGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+        root: PathBuf,
+    }
+
+    impl ConfigHomeGuard {
+        fn new(root: &Path) -> Self {
+            let lock = crate::test_env_lock();
+            let config_home = root.join("home").join(".claw");
+            fs::create_dir_all(&config_home).expect("create config home");
+            let previous = std::env::var_os("CLAW_CONFIG_HOME");
+            std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+            Self {
+                _lock: lock,
+                previous,
+                root: config_home,
+            }
+        }
+    }
+
+    impl Drop for ConfigHomeGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+                None => std::env::remove_var("CLAW_CONFIG_HOME"),
+            }
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
 
     #[test]
     fn workspace_sessions_dir_returns_fingerprinted_path_for_valid_cwd() {
         let tmp = std::env::temp_dir().join("claw-session-dir-test");
+        let _config_home = ConfigHomeGuard::new(&tmp);
         fs::create_dir_all(&tmp).expect("create temp dir");
 
         let result = workspace_sessions_dir(&tmp);
@@ -1499,6 +1734,8 @@ mod workspace_sessions_dir_tests {
     fn workspace_sessions_dir_differs_for_different_cwds() {
         let tmp_a = std::env::temp_dir().join("claw-session-dir-a");
         let tmp_b = std::env::temp_dir().join("claw-session-dir-b");
+        let config_root = std::env::temp_dir().join("claw-session-dir-config-home");
+        let _config_home = ConfigHomeGuard::new(&config_root);
         fs::create_dir_all(&tmp_a).expect("create dir a");
         fs::create_dir_all(&tmp_b).expect("create dir b");
 
@@ -1511,5 +1748,6 @@ mod workspace_sessions_dir_tests {
 
         fs::remove_dir_all(&tmp_a).ok();
         fs::remove_dir_all(&tmp_b).ok();
+        fs::remove_dir_all(&config_root).ok();
     }
 }

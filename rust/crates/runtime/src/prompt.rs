@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use claw_core::{limit_text_chars, ContextAssemblyBudget};
+
 use crate::config::{ConfigError, ConfigLoader, RuntimeConfig};
 use crate::git_context::GitContext;
 
@@ -39,8 +41,6 @@ impl From<ConfigError> for PromptBuildError {
 
 /// Marker separating static prompt scaffolding from dynamic runtime context.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
-const MAX_INSTRUCTION_FILE_CHARS: usize = 4_000;
-const MAX_TOTAL_INSTRUCTION_CHARS: usize = 12_000;
 
 /// Best-effort local date string for runtime-facing prompt/context output.
 ///
@@ -312,21 +312,38 @@ fn read_git_status(cwd: &Path) -> Option<String> {
     if trimmed.is_empty() {
         None
     } else {
-        Some(trimmed.to_string())
+        Some(
+            ContextAssemblyBudget::default()
+                .git_status()
+                .apply(trimmed)
+                .text,
+        )
     }
 }
 
 fn read_git_diff(cwd: &Path) -> Option<String> {
     let mut sections = Vec::new();
 
-    let staged = read_git_output(cwd, &["diff", "--cached"])?;
+    let staged = read_git_output(cwd, &["diff", "--cached", "--stat=100,60,200"])?;
     if !staged.trim().is_empty() {
-        sections.push(format!("Staged changes:\n{}", staged.trim_end()));
+        sections.push(format!(
+            "Staged changes:\n{}",
+            ContextAssemblyBudget::default()
+                .git_diff()
+                .apply(staged.trim_end())
+                .text
+        ));
     }
 
-    let unstaged = read_git_output(cwd, &["diff"])?;
+    let unstaged = read_git_output(cwd, &["diff", "--stat=100,60,200"])?;
     if !unstaged.trim().is_empty() {
-        sections.push(format!("Unstaged changes:\n{}", unstaged.trim_end()));
+        sections.push(format!(
+            "Unstaged changes:\n{}",
+            ContextAssemblyBudget::default()
+                .git_diff()
+                .apply(unstaged.trim_end())
+                .text
+        ));
     }
 
     if sections.is_empty() {
@@ -392,7 +409,8 @@ fn render_project_context(project_context: &ProjectContext) -> String {
 
 fn render_instruction_files(files: &[ContextFile]) -> String {
     let mut sections = vec!["# Project instructions".to_string()];
-    let mut remaining_chars = MAX_TOTAL_INSTRUCTION_CHARS;
+    let budget = ContextAssemblyBudget::default();
+    let mut remaining_chars = budget.total_instruction_chars;
     for file in files {
         if remaining_chars == 0 {
             sections.push(
@@ -454,19 +472,22 @@ fn describe_instruction_file(file: &ContextFile, files: &[ContextFile]) -> Strin
 }
 
 fn truncate_instruction_content(content: &str, remaining_chars: usize) -> String {
-    let hard_limit = MAX_INSTRUCTION_FILE_CHARS.min(remaining_chars);
+    let hard_limit = ContextAssemblyBudget::default()
+        .instruction_file_chars
+        .min(remaining_chars);
     let trimmed = content.trim();
     if trimmed.chars().count() <= hard_limit {
         return trimmed.to_string();
     }
 
-    let mut output = trimmed.chars().take(hard_limit).collect::<String>();
-    output.push_str("\n\n[truncated]");
-    output
+    limit_text_chars(trimmed, hard_limit, "instruction file").text
 }
 
 fn render_instruction_content(content: &str) -> String {
-    truncate_instruction_content(content, MAX_INSTRUCTION_FILE_CHARS)
+    truncate_instruction_content(
+        content,
+        ContextAssemblyBudget::default().instruction_file_chars,
+    )
 }
 
 fn display_context_path(path: &Path) -> String {
@@ -679,8 +700,8 @@ mod tests {
     #[test]
     fn truncates_large_instruction_content_for_rendering() {
         let rendered = render_instruction_content(&"x".repeat(4500));
-        assert!(rendered.contains("[truncated]"));
-        assert!(rendered.len() < 4_100);
+        assert!(rendered.contains("truncated"));
+        assert!(rendered.len() < 4_200);
     }
 
     #[test]
@@ -851,6 +872,51 @@ mod tests {
     }
 
     #[test]
+    fn discover_with_git_summarizes_large_diff_snapshot() {
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git init should run");
+        std::process::Command::new("git")
+            .args(["config", "user.email", "tests@example.com"])
+            .current_dir(&root)
+            .status()
+            .expect("git config email should run");
+        std::process::Command::new("git")
+            .args(["config", "user.name", "Runtime Prompt Tests"])
+            .current_dir(&root)
+            .status()
+            .expect("git config name should run");
+        fs::write(root.join("tracked.txt"), "hello\n").expect("write tracked file");
+        std::process::Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(&root)
+            .status()
+            .expect("git add should run");
+        std::process::Command::new("git")
+            .args(["commit", "-m", "init", "--quiet"])
+            .current_dir(&root)
+            .status()
+            .expect("git commit should run");
+        fs::write(root.join("tracked.txt"), "x\n".repeat(20_000)).expect("rewrite tracked file");
+
+        let context =
+            ProjectContext::discover_with_git(&root, "2026-03-31").expect("context should load");
+
+        let diff = context.git_diff.expect("git diff should be present");
+        assert!(diff.contains("tracked.txt"));
+        assert!(!diff.contains("+x"));
+        assert!(diff.len() < 18_000);
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
     fn load_system_prompt_reads_claude_files_and_config() {
         let root = temp_dir();
         fs::create_dir_all(root.join(".claw")).expect("claw dir");
@@ -938,8 +1004,8 @@ mod tests {
     fn truncates_instruction_content_to_budget() {
         let content = "x".repeat(5_000);
         let rendered = truncate_instruction_content(&content, 4_000);
-        assert!(rendered.contains("[truncated]"));
-        assert!(rendered.chars().count() <= 4_000 + "\n\n[truncated]".chars().count());
+        assert!(rendered.contains("truncated"));
+        assert!(rendered.chars().count() <= 4_100);
     }
 
     #[test]

@@ -328,10 +328,16 @@ fi
 
 info "running: cargo ${CARGO_FLAGS[*]}"
 info "this may take a few minutes on the first build"
+info "dependencies are fetched online via Cargo; configure CARGO_REGISTRIES_* or a crates.io mirror if your network requires one"
 
 (
     cd "${RUST_DIR}"
-    CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"
+    if ! CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}" cargo "${CARGO_FLAGS[@]}"; then
+        error "cargo build failed"
+        error "If this is a network failure after removing rust/vendor, check crates.io access or configure a Cargo registry mirror."
+        error "For offline environments, restore a vendor directory and .cargo source replacement before running this installer."
+        exit 1
+    fi
 )
 
 CLAW_BIN="${RUST_DIR}/target/${BUILD_PROFILE}/claw"
@@ -429,7 +435,7 @@ Try it out:
 
 Authentication:
 
-  ${COLOR_DIM}# Option A: set up rust/.claw/config.json once${COLOR_RESET}
+  ${COLOR_DIM}# Option A: set up ~/.claw/config.json once${COLOR_RESET}
   ${COLOR_DIM}# Option B: export provider env vars manually${COLOR_RESET}
   ${COLOR_DIM}# Option C: use OAuth:${COLOR_RESET}
   claw login

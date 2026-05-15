@@ -7,6 +7,7 @@ publish.workspace = true
 
 [dependencies]
 api = { path = "../api" }
+claw-core = { path = "../claw-core" }
 commands = { path = "../commands" }
 flate2 = "1"
 plugins = { path = "../plugins" }

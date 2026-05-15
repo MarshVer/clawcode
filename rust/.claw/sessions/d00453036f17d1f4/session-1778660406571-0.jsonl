@@ -1,4 +1,0 @@
-{"created_at_ms":1778660406571,"model":"deepseek-ai/DeepSeek-V3.2","session_id":"session-1778660406571-0","type":"session_meta","updated_at_ms":1778660421933,"version":1}
-{"text":"你是谁?","timestamp_ms":1778660415549,"type":"prompt_history"}
-{"message":{"blocks":[{"text":"你是谁?","type":"text"}],"role":"user"},"type":"message"}
-{"message":{"blocks":[{"text":"我是您的编码助手！我是由DeepSeek开发的大语言模型，可以帮助您处理各种软件工程任务，包括：\n\n- 编写、分析和调试代码\n- 阅读和理解项目文件\n- 运行命令和测试\n- 重构和优化代码\n- 解决技术问题\n\n我看到您在一个Rust项目工作目录中，这是一个clawcode/rust项目。我可以帮助您浏览和理解项目结构、修改代码、运行构建等任务。\n\n有什么具体需要我帮助的吗？","type":"text"}],"role":"assistant","usage":{"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"input_tokens":9318,"output_tokens":101}},"type":"message"}

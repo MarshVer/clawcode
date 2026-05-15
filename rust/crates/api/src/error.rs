@@ -34,6 +34,7 @@ pub enum ApiError {
         requested_output_tokens: u32,
         estimated_total_tokens: u32,
         context_window_tokens: u32,
+        max_prompt_tokens: Option<u32>,
     },
     ExpiredOAuthToken,
     Auth(String),
@@ -265,9 +266,11 @@ impl Display for ApiError {
                 requested_output_tokens,
                 estimated_total_tokens,
                 context_window_tokens,
+                max_prompt_tokens,
             } => write!(
                 f,
-                "context_window_blocked for {model}: estimated input {estimated_input_tokens} + requested output {requested_output_tokens} = {estimated_total_tokens} tokens exceeds the {context_window_tokens}-token context window; compact the session or reduce request size before retrying"
+                "context_window_blocked for {model}: estimated input {estimated_input_tokens} + requested output {requested_output_tokens} = {estimated_total_tokens} tokens exceeds the {context_window_tokens}-token context window{}; compact the session or reduce request size before retrying",
+                max_prompt_tokens.map_or_else(String::new, |limit| format!(" and/or the {limit}-token max prompt limit"))
             ),
             Self::ExpiredOAuthToken => {
                 write!(

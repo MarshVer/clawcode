@@ -7,6 +7,7 @@
 //! active `PermissionPolicy`.
 
 use crate::permissions::{PermissionMode, PermissionOutcome, PermissionPolicy};
+use claw_core::{is_read_only_shell_command, PathPolicy};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,7 +114,7 @@ impl PermissionEnforcer {
 
         match mode {
             PermissionMode::ReadOnly => {
-                if is_read_only_command(command) {
+                if is_read_only_shell_command(command) {
                     EnforcementResult::Allowed
                 } else {
                     EnforcementResult::Denied {
@@ -141,100 +142,7 @@ impl PermissionEnforcer {
 
 /// Simple workspace boundary check via string prefix.
 fn is_within_workspace(path: &str, workspace_root: &str) -> bool {
-    let normalized = if path.starts_with('/') {
-        path.to_owned()
-    } else {
-        format!("{workspace_root}/{path}")
-    };
-
-    let root = if workspace_root.ends_with('/') {
-        workspace_root.to_owned()
-    } else {
-        format!("{workspace_root}/")
-    };
-
-    normalized.starts_with(&root) || normalized == workspace_root.trim_end_matches('/')
-}
-
-/// Conservative heuristic: is this bash command read-only?
-fn is_read_only_command(command: &str) -> bool {
-    let first_token = command
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .rsplit('/')
-        .next()
-        .unwrap_or("");
-
-    matches!(
-        first_token,
-        "cat"
-            | "head"
-            | "tail"
-            | "less"
-            | "more"
-            | "wc"
-            | "ls"
-            | "find"
-            | "grep"
-            | "rg"
-            | "awk"
-            | "sed"
-            | "echo"
-            | "printf"
-            | "which"
-            | "where"
-            | "whoami"
-            | "pwd"
-            | "env"
-            | "printenv"
-            | "date"
-            | "cal"
-            | "df"
-            | "du"
-            | "free"
-            | "uptime"
-            | "uname"
-            | "file"
-            | "stat"
-            | "diff"
-            | "sort"
-            | "uniq"
-            | "tr"
-            | "cut"
-            | "paste"
-            | "tee"
-            | "xargs"
-            | "test"
-            | "true"
-            | "false"
-            | "type"
-            | "readlink"
-            | "realpath"
-            | "basename"
-            | "dirname"
-            | "sha256sum"
-            | "md5sum"
-            | "b3sum"
-            | "xxd"
-            | "hexdump"
-            | "od"
-            | "strings"
-            | "tree"
-            | "jq"
-            | "yq"
-            | "python3"
-            | "python"
-            | "node"
-            | "ruby"
-            | "cargo"
-            | "rustc"
-            | "git"
-            | "gh"
-    ) && !command.contains("-i ")
-        && !command.contains("--in-place")
-        && !command.contains(" > ")
-        && !command.contains(" >> ")
+    PathPolicy::new(workspace_root).is_within_workspace(std::path::Path::new(path))
 }
 
 #[cfg(test)]
@@ -333,12 +241,12 @@ mod tests {
 
     #[test]
     fn read_only_command_heuristic() {
-        assert!(is_read_only_command("cat file.txt"));
-        assert!(is_read_only_command("grep pattern file"));
-        assert!(is_read_only_command("git log --oneline"));
-        assert!(!is_read_only_command("rm file.txt"));
-        assert!(!is_read_only_command("echo test > file.txt"));
-        assert!(!is_read_only_command("sed -i 's/a/b/' file"));
+        assert!(is_read_only_shell_command("cat file.txt"));
+        assert!(is_read_only_shell_command("grep pattern file"));
+        assert!(is_read_only_shell_command("git log --oneline"));
+        assert!(!is_read_only_shell_command("rm file.txt"));
+        assert!(!is_read_only_shell_command("echo test > file.txt"));
+        assert!(!is_read_only_shell_command("sed -i 's/a/b/' file"));
     }
 
     #[test]
@@ -446,8 +354,8 @@ mod tests {
         let git_path_command = "/usr/local/bin/git status";
 
         // when
-        let cat_result = is_read_only_command(full_path_command);
-        let git_result = is_read_only_command(git_path_command);
+        let cat_result = is_read_only_shell_command(full_path_command);
+        let git_result = is_read_only_shell_command(git_path_command);
 
         // then
         assert!(cat_result);
@@ -461,8 +369,8 @@ mod tests {
         let append = "echo test >> out.txt";
 
         // when
-        let overwrite_result = is_read_only_command(overwrite);
-        let append_result = is_read_only_command(append);
+        let overwrite_result = is_read_only_shell_command(overwrite);
+        let append_result = is_read_only_shell_command(append);
 
         // then
         assert!(!overwrite_result);
@@ -476,8 +384,8 @@ mod tests {
         let in_place_sed = "sed --in-place 's/a/b/' file.txt";
 
         // when
-        let interactive_result = is_read_only_command(interactive_python);
-        let in_place_result = is_read_only_command(in_place_sed);
+        let interactive_result = is_read_only_shell_command(interactive_python);
+        let in_place_result = is_read_only_shell_command(in_place_sed);
 
         // then
         assert!(!interactive_result);
@@ -491,8 +399,8 @@ mod tests {
         let whitespace = "   ";
 
         // when
-        let empty_result = is_read_only_command(empty);
-        let whitespace_result = is_read_only_command(whitespace);
+        let empty_result = is_read_only_shell_command(empty);
+        let whitespace_result = is_read_only_shell_command(whitespace);
 
         // then
         assert!(!empty_result);

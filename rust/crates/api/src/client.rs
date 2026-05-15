@@ -130,7 +130,7 @@ impl MessageStream {
 }
 
 pub use anthropic::{
-    oauth_token_is_expired, resolve_saved_oauth_token, resolve_startup_auth_source, OAuthTokenSet,
+    oauth_token_is_expired, resolve_saved_oauth_token, resolve_startup_auth_source,
 };
 #[must_use]
 pub fn read_base_url() -> String {

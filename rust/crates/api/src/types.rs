@@ -1,4 +1,7 @@
-use runtime::{pricing_for_model, TokenUsage, UsageCostEstimate};
+use claw_core::{
+    pricing_for_model, sanitize_tool_result_pairing, ModelCapability, SharedContentBlock,
+    SharedConversationMessage, SharedMessageRole, TokenUsage, UsageCostEstimate,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -31,6 +34,8 @@ pub struct MessageRequest {
     /// Silently ignored by backends that do not support it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    #[serde(skip)]
+    pub model_capability_override: Option<ModelCapability>,
 }
 
 impl MessageRequest {
@@ -205,6 +210,122 @@ impl Usage {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        tool_name: String,
+        output: String,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMessageRole {
+    System,
+    User,
+    Assistant,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeConversationMessage {
+    pub role: RuntimeMessageRole,
+    pub blocks: Vec<RuntimeContentBlock>,
+}
+
+#[must_use]
+pub fn runtime_messages_to_input_messages(
+    messages: &[RuntimeConversationMessage],
+) -> Vec<InputMessage> {
+    sanitize_tool_result_pairing(&shared_messages_from_runtime(messages))
+        .into_iter()
+        .filter_map(input_message_from_shared)
+        .collect()
+}
+
+fn shared_messages_from_runtime(
+    messages: &[RuntimeConversationMessage],
+) -> Vec<SharedConversationMessage> {
+    messages
+        .iter()
+        .map(|message| SharedConversationMessage {
+            role: match message.role {
+                RuntimeMessageRole::System => SharedMessageRole::System,
+                RuntimeMessageRole::User => SharedMessageRole::User,
+                RuntimeMessageRole::Assistant => SharedMessageRole::Assistant,
+                RuntimeMessageRole::Tool => SharedMessageRole::Tool,
+            },
+            blocks: message.blocks.iter().map(shared_block_from_runtime).collect(),
+        })
+        .collect()
+}
+
+fn shared_block_from_runtime(block: &RuntimeContentBlock) -> SharedContentBlock {
+    match block {
+        RuntimeContentBlock::Text { text } => SharedContentBlock::Text { text: text.clone() },
+        RuntimeContentBlock::ToolUse { id, name, input } => SharedContentBlock::ToolUse {
+            id: id.clone(),
+            name: name.clone(),
+            input: input.clone(),
+        },
+        RuntimeContentBlock::ToolResult {
+            tool_use_id,
+            tool_name,
+            output,
+            is_error,
+        } => SharedContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            tool_name: tool_name.clone(),
+            output: output.clone(),
+            is_error: *is_error,
+        },
+    }
+}
+
+fn input_message_from_shared(message: SharedConversationMessage) -> Option<InputMessage> {
+    let role = match message.role {
+        SharedMessageRole::System | SharedMessageRole::User | SharedMessageRole::Tool => "user",
+        SharedMessageRole::Assistant => "assistant",
+    };
+    let content = message
+        .blocks
+        .into_iter()
+        .map(|block| match block {
+            SharedContentBlock::Text { text } => InputContentBlock::Text { text },
+            SharedContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                id,
+                name,
+                input: serde_json::from_str(&input)
+                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+            },
+            SharedContentBlock::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+                ..
+            } => InputContentBlock::ToolResult {
+                tool_use_id,
+                content: vec![ToolResultContentBlock::Text { text: output }],
+                is_error,
+            },
+        })
+        .collect::<Vec<_>>();
+
+    (!content.is_empty()).then(|| InputMessage {
+        role: role.to_string(),
+        content,
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MessageStartEvent {
     pub message: MessageResponse,
@@ -267,9 +388,12 @@ pub enum StreamEvent {
 
 #[cfg(test)]
 mod tests {
-    use runtime::format_usd;
+    use claw_core::format_usd;
 
-    use super::{MessageResponse, Usage};
+    use super::{
+        runtime_messages_to_input_messages, MessageResponse, RuntimeContentBlock,
+        RuntimeConversationMessage, RuntimeMessageRole, Usage,
+    };
 
     #[test]
     fn usage_total_tokens_includes_cache_tokens() {
@@ -306,5 +430,42 @@ mod tests {
         let cost = response.usage.estimated_cost_usd(&response.model);
         assert_eq!(format_usd(cost.total_cost_usd()), "$54.6750");
         assert_eq!(response.total_tokens(), 1_800_000);
+    }
+
+    #[test]
+    fn runtime_message_conversion_removes_orphan_tool_results() {
+        let messages = vec![
+            RuntimeConversationMessage {
+                role: RuntimeMessageRole::Tool,
+                blocks: vec![RuntimeContentBlock::ToolResult {
+                    tool_use_id: "missing".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "orphan".to_string(),
+                    is_error: false,
+                }],
+            },
+            RuntimeConversationMessage {
+                role: RuntimeMessageRole::Assistant,
+                blocks: vec![RuntimeContentBlock::ToolUse {
+                    id: "tool-1".to_string(),
+                    name: "bash".to_string(),
+                    input: r#"{"command":"pwd"}"#.to_string(),
+                }],
+            },
+            RuntimeConversationMessage {
+                role: RuntimeMessageRole::Tool,
+                blocks: vec![RuntimeContentBlock::ToolResult {
+                    tool_use_id: "tool-1".to_string(),
+                    tool_name: "bash".to_string(),
+                    output: "/tmp".to_string(),
+                    is_error: false,
+                }],
+            },
+        ];
+
+        let converted = runtime_messages_to_input_messages(&messages);
+        assert_eq!(converted.len(), 2);
+        assert_eq!(converted[0].role, "assistant");
+        assert_eq!(converted[1].role, "user");
     }
 }

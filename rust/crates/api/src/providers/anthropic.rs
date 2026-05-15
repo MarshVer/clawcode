@@ -3,10 +3,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use runtime::format_usd;
-use runtime::{
-    load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
-    OAuthTokenExchangeRequest,
+use claw_core::{
+    format_usd, load_oauth_credentials, save_oauth_credentials, OAuthConfig, OAuthRefreshRequest,
+    OAuthTokenExchangeRequest, OAuthTokenSet,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -17,7 +16,8 @@ use crate::http_client::build_http_client_or_default;
 use crate::prompt_cache::{PromptCache, PromptCacheRecord, PromptCacheStats};
 
 use super::{
-    anthropic_missing_credentials, model_token_limit, resolve_model_alias, Provider, ProviderFuture,
+    anthropic_missing_credentials, model_token_limit_for_request, resolve_model_alias, Provider,
+    ProviderFuture,
 };
 use crate::sse::SseParser;
 use crate::types::{MessageDeltaEvent, MessageRequest, MessageResponse, StreamEvent, Usage};
@@ -93,15 +93,6 @@ impl AuthSource {
         }
         request_builder
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct OAuthTokenSet {
-    pub access_token: String,
-    pub refresh_token: Option<String>,
-    pub expires_at: Option<u64>,
-    #[serde(default)]
-    pub scopes: Vec<String>,
 }
 
 impl From<OAuthTokenSet> for AuthSource {
@@ -495,7 +486,7 @@ impl AnthropicClient {
         // round trip.
         super::preflight_message_request(request)?;
 
-        let Some(limit) = model_token_limit(&request.model) else {
+        let Some(limit) = model_token_limit_for_request(request) else {
             return Ok(());
         };
 
@@ -514,6 +505,7 @@ impl AnthropicClient {
                 requested_output_tokens: request.max_tokens,
                 estimated_total_tokens,
                 context_window_tokens: limit.context_window_tokens,
+                max_prompt_tokens: limit.max_prompt_tokens,
             });
         }
 
@@ -735,13 +727,7 @@ fn resolve_saved_oauth_token_set(
         expires_at: refreshed.expires_at,
         scopes: refreshed.scopes,
     };
-    save_oauth_credentials(&runtime::OAuthTokenSet {
-        access_token: resolved.access_token.clone(),
-        refresh_token: resolved.refresh_token.clone(),
-        expires_at: resolved.expires_at,
-        scopes: resolved.scopes.clone(),
-    })
-    .map_err(ApiError::from)?;
+    save_oauth_credentials(&resolved).map_err(ApiError::from)?;
     Ok(resolved)
 }
 
@@ -755,13 +741,7 @@ where
 }
 
 fn load_saved_oauth_token() -> Result<Option<OAuthTokenSet>, ApiError> {
-    let token_set = load_oauth_credentials().map_err(ApiError::from)?;
-    Ok(token_set.map(|token_set| OAuthTokenSet {
-        access_token: token_set.access_token,
-        refresh_token: token_set.refresh_token,
-        expires_at: token_set.expires_at,
-        scopes: token_set.scopes,
-    }))
+    load_oauth_credentials().map_err(ApiError::from)
 }
 
 fn now_unix_timestamp() -> u64 {
@@ -1044,7 +1024,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use runtime::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
+    use claw_core::{clear_oauth_credentials, save_oauth_credentials, OAuthConfig};
 
     use super::{
         now_unix_timestamp, oauth_token_is_expired, resolve_saved_oauth_token,
@@ -1186,7 +1166,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
             expires_at: Some(now_unix_timestamp() + 300),
@@ -1225,7 +1205,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(1),
@@ -1240,7 +1220,7 @@ mod tests {
             .expect("resolve refreshed token")
             .expect("token set present");
         assert_eq!(resolved.access_token, "refreshed-token");
-        let stored = runtime::load_oauth_credentials()
+        let stored = load_oauth_credentials()
             .expect("load stored credentials")
             .expect("stored token set");
         assert_eq!(stored.access_token, "refreshed-token");
@@ -1257,7 +1237,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "saved-access-token".to_string(),
             refresh_token: Some("refresh".to_string()),
             expires_at: Some(now_unix_timestamp() + 300),
@@ -1281,7 +1261,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(1),
@@ -1295,7 +1275,7 @@ mod tests {
             matches!(error, crate::error::ApiError::Auth(message) if message.contains("runtime OAuth config is missing"))
         );
 
-        let stored = runtime::load_oauth_credentials()
+        let stored = load_oauth_credentials()
             .expect("load stored credentials")
             .expect("stored token set");
         assert_eq!(stored.access_token, "expired-access-token");
@@ -1313,7 +1293,7 @@ mod tests {
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
         std::env::remove_var("ANTHROPIC_API_KEY");
-        save_oauth_credentials(&runtime::OAuthTokenSet {
+        save_oauth_credentials(&OAuthTokenSet {
             access_token: "expired-access-token".to_string(),
             refresh_token: Some("refresh-token".to_string()),
             expires_at: Some(1),
@@ -1329,7 +1309,7 @@ mod tests {
             .expect("token set present");
         assert_eq!(resolved.access_token, "refreshed-token");
         assert_eq!(resolved.refresh_token.as_deref(), Some("refresh-token"));
-        let stored = runtime::load_oauth_credentials()
+        let stored = load_oauth_credentials()
             .expect("load stored credentials")
             .expect("stored token set");
         assert_eq!(stored.refresh_token.as_deref(), Some("refresh-token"));

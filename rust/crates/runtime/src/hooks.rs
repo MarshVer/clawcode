@@ -10,6 +10,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
+use claw_core::{limit_text_chars, ContextAssemblyBudget};
+
 use crate::config::{RuntimeFeatureConfig, RuntimeHookConfig};
 use crate::permissions::PermissionOverride;
 
@@ -520,7 +522,14 @@ impl ParsedHookOutput {
 }
 
 fn merge_parsed_hook_output(target: &mut HookRunResult, parsed: ParsedHookOutput) {
-    target.messages.extend(parsed.messages);
+    target.messages.extend(parsed.messages.into_iter().map(|message| {
+        limit_text_chars(
+            &message,
+            ContextAssemblyBudget::default().hook_message_chars,
+            "hook message",
+        )
+        .text
+    }));
     if parsed.permission_override.is_some() {
         target.permission_override = parsed.permission_override;
     }
@@ -601,7 +610,7 @@ fn hook_payload(
             "tool_name": tool_name,
             "tool_input": parse_tool_input(tool_input),
             "tool_input_json": tool_input,
-            "tool_error": tool_output,
+            "tool_error": budget_hook_tool_output(tool_output),
             "tool_result_is_error": true,
         }),
         _ => json!({
@@ -609,10 +618,21 @@ fn hook_payload(
             "tool_name": tool_name,
             "tool_input": parse_tool_input(tool_input),
             "tool_input_json": tool_input,
-            "tool_output": tool_output,
+            "tool_output": budget_hook_tool_output(tool_output),
             "tool_result_is_error": is_error,
         }),
     }
+}
+
+fn budget_hook_tool_output(tool_output: Option<&str>) -> Option<String> {
+    tool_output.map(|output| {
+        limit_text_chars(
+            output,
+            ContextAssemblyBudget::default().hook_message_chars,
+            "hook tool output",
+        )
+        .text
+    })
 }
 
 fn parse_tool_input(tool_input: &str) -> Value {

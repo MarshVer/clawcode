@@ -10,6 +10,8 @@
 
 use std::path::Path;
 
+use claw_core::{has_write_redirection, split_shell_segments};
+
 use crate::permissions::PermissionMode;
 
 /// Result of validating a bash command before execution.
@@ -93,9 +95,6 @@ const STATE_MODIFYING_COMMANDS: &[&str] = &[
     "at",
 ];
 
-/// Shell redirection operators that indicate writes.
-const WRITE_REDIRECTIONS: &[&str] = &[">", ">>", ">&"];
-
 /// Validate that a command is allowed under read-only mode.
 ///
 /// Corresponds to upstream `tools/BashTool/readOnlyValidation.ts`.
@@ -105,6 +104,24 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
         return ValidationResult::Allow;
     }
 
+    if has_write_redirection(command) {
+        return ValidationResult::Block {
+            reason: "Command contains write redirection which is not allowed in read-only mode"
+                .to_string(),
+        };
+    }
+
+    for segment in split_shell_segments(command) {
+        let result = validate_read_only_segment(&segment, mode);
+        if result != ValidationResult::Allow {
+            return result;
+        }
+    }
+
+    ValidationResult::Allow
+}
+
+fn validate_read_only_segment(command: &str, mode: PermissionMode) -> ValidationResult {
     let first_command = extract_first_command(command);
 
     // Check for write commands.
@@ -133,21 +150,10 @@ pub fn validate_read_only(command: &str, mode: PermissionMode) -> ValidationResu
     if first_command == "sudo" {
         let inner = extract_sudo_inner(command);
         if !inner.is_empty() {
-            let inner_result = validate_read_only(inner, mode);
+            let inner_result = validate_read_only_segment(inner, mode);
             if inner_result != ValidationResult::Allow {
                 return inner_result;
             }
-        }
-    }
-
-    // Check for write redirections.
-    for &redir in WRITE_REDIRECTIONS {
-        if command.contains(redir) {
-            return ValidationResult::Block {
-                reason: format!(
-                    "Command contains write redirection '{redir}' which is not allowed in read-only mode"
-                ),
-            };
         }
     }
 

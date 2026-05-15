@@ -9,6 +9,8 @@ use regex::RegexBuilder;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use claw_core::{ensure_within_workspace, PathPolicy};
+
 /// Maximum file size that can be read (10 MB).
 const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
 
@@ -23,24 +25,6 @@ fn is_binary_file(path: &Path) -> io::Result<bool> {
     let mut buffer = [0u8; 8192];
     let bytes_read = file.read(&mut buffer)?;
     Ok(buffer[..bytes_read].contains(&0))
-}
-
-/// Validate that a resolved path stays within the given workspace root.
-/// Returns the canonical path on success, or an error if the path escapes
-/// the workspace boundary (e.g. via `../` traversal or symlink).
-#[allow(dead_code)]
-fn validate_workspace_boundary(resolved: &Path, workspace_root: &Path) -> io::Result<()> {
-    if !resolved.starts_with(workspace_root) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "path {} escapes workspace boundary {}",
-                resolved.display(),
-                workspace_root.display()
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Text payload returned by file-reading operations.
@@ -347,6 +331,20 @@ pub fn glob_search(pattern: &str, path: Option<&str>) -> io::Result<GlobSearchOu
     })
 }
 
+/// Expands a glob pattern within a workspace boundary.
+pub fn glob_search_in_workspace(
+    pattern: &str,
+    path: Option<&str>,
+    workspace_root: &Path,
+) -> io::Result<GlobSearchOutput> {
+    let policy = PathPolicy::new(workspace_root);
+    let base_dir = match path {
+        Some(path) => policy.resolve_existing(path)?,
+        None => policy.canonical_root()?,
+    };
+    glob_search(pattern, Some(base_dir.to_string_lossy().as_ref()))
+}
+
 /// Runs a regex search over workspace files with optional context lines.
 pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     let base_path = input
@@ -457,6 +455,22 @@ pub fn grep_search(input: &GrepSearchInput) -> io::Result<GrepSearchOutput> {
     })
 }
 
+/// Runs a grep-style search within a workspace boundary.
+pub fn grep_search_in_workspace(
+    input: &GrepSearchInput,
+    workspace_root: &Path,
+) -> io::Result<GrepSearchOutput> {
+    let policy = PathPolicy::new(workspace_root);
+    let mut scoped = input.clone();
+    scoped.path = Some(match input.path.as_deref() {
+        Some(path) => policy.resolve_existing(path)?,
+        None => policy.canonical_root()?,
+    }
+    .to_string_lossy()
+    .into_owned());
+    grep_search(&scoped)
+}
+
 fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
         return Ok(vec![base_path.to_path_buf()]);
@@ -565,6 +579,10 @@ fn normalize_path_allow_missing(path: &str) -> io::Result<PathBuf> {
     Ok(candidate)
 }
 
+fn normalize_missing_path_in_workspace(path: &str, workspace_root: &Path) -> io::Result<PathBuf> {
+    PathPolicy::new(workspace_root).resolve_missing(path)
+}
+
 /// Read a file with workspace boundary enforcement.
 #[allow(dead_code)]
 pub fn read_file_in_workspace(
@@ -573,12 +591,8 @@ pub fn read_file_in_workspace(
     limit: Option<usize>,
     workspace_root: &Path,
 ) -> io::Result<ReadFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    read_file(path, offset, limit)
+    let absolute_path = PathPolicy::new(workspace_root).resolve_existing(path)?;
+    read_file(absolute_path.to_string_lossy().as_ref(), offset, limit)
 }
 
 /// Write a file with workspace boundary enforcement.
@@ -588,12 +602,8 @@ pub fn write_file_in_workspace(
     content: &str,
     workspace_root: &Path,
 ) -> io::Result<WriteFileOutput> {
-    let absolute_path = normalize_path_allow_missing(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    write_file(path, content)
+    let absolute_path = normalize_missing_path_in_workspace(path, workspace_root)?;
+    write_file(absolute_path.to_string_lossy().as_ref(), content)
 }
 
 /// Edit a file with workspace boundary enforcement.
@@ -605,12 +615,13 @@ pub fn edit_file_in_workspace(
     replace_all: bool,
     workspace_root: &Path,
 ) -> io::Result<EditFileOutput> {
-    let absolute_path = normalize_path(path)?;
-    let canonical_root = workspace_root
-        .canonicalize()
-        .unwrap_or_else(|_| workspace_root.to_path_buf());
-    validate_workspace_boundary(&absolute_path, &canonical_root)?;
-    edit_file(path, old_string, new_string, replace_all)
+    let absolute_path = PathPolicy::new(workspace_root).resolve_existing(path)?;
+    edit_file(
+        absolute_path.to_string_lossy().as_ref(),
+        old_string,
+        new_string,
+        replace_all,
+    )
 }
 
 /// Check whether a path is a symlink that resolves outside the workspace.
@@ -624,7 +635,7 @@ pub fn is_symlink_escape(path: &Path, workspace_root: &Path) -> io::Result<bool>
     let canonical_root = workspace_root
         .canonicalize()
         .unwrap_or_else(|_| workspace_root.to_path_buf());
-    Ok(!resolved.starts_with(&canonical_root))
+    Ok(ensure_within_workspace(&resolved, &canonical_root).is_err())
 }
 
 /// Expand shell-style brace groups in a glob pattern.

@@ -1,6 +1,8 @@
 use std::path::Path;
 use std::process::Command;
 
+use claw_core::ContextAssemblyBudget;
+
 /// A single git commit entry from the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitCommitEntry {
@@ -137,11 +139,20 @@ fn read_staged_files(cwd: &Path) -> Vec<String> {
         return Vec::new();
     }
     let stdout = String::from_utf8(output.stdout).unwrap_or_default();
-    stdout
+    let mut files = stdout
         .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| line.trim().to_string())
-        .collect()
+        .collect::<Vec<_>>();
+    let max_staged_files = ContextAssemblyBudget::default().staged_files;
+    let omitted = files.len().saturating_sub(max_staged_files);
+    files.truncate(max_staged_files);
+    if omitted > 0 {
+        files.push(format!(
+            "... omitted {omitted} additional staged file(s); use git diff --cached --name-only for the full list."
+        ));
+    }
+    files
 }
 
 #[cfg(test)]
@@ -236,6 +247,34 @@ mod tests {
 
         // then
         assert_eq!(context.staged_files, vec!["staged.txt"]);
+        fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[test]
+    fn staged_file_list_is_limited_for_prompt_safety() {
+        // given
+        let _guard = env_lock();
+        ensure_valid_cwd();
+        let root = temp_dir("many-staged");
+        fs::create_dir_all(&root).expect("create dir");
+        git(&root, &["init", "--quiet", "--initial-branch=main"]);
+        git(&root, &["config", "user.email", "tests@example.com"]);
+        git(&root, &["config", "user.name", "Git Context Tests"]);
+        fs::write(root.join("init.txt"), "init\n").expect("write init");
+        git(&root, &["add", "init.txt"]);
+        git(&root, &["commit", "-m", "initial", "--quiet"]);
+        for index in 0..205 {
+            let name = format!("staged-{index:03}.txt");
+            fs::write(root.join(&name), "staged\n").expect("write staged");
+            git(&root, &["add", &name]);
+        }
+
+        // when
+        let context = GitContext::detect(&root).expect("should detect git repo");
+
+        // then
+        assert_eq!(context.staged_files.len(), 201);
+        assert!(context.staged_files.last().is_some_and(|entry| entry.contains("omitted")));
         fs::remove_dir_all(root).expect("cleanup");
     }
 

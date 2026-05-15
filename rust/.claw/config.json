@@ -1,6 +1,0 @@
-{
-  "provider": "openai",
-  "model": "deepseek-ai/DeepSeek-V3.2",
-  "url": "https://api.siliconflow.cn/v1",
-  "key": "sk-fxtynsjcxjklsosiyfatrhkibsohdyvsviiooyaushgsdlhp"
-}

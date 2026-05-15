@@ -1,5 +1,4 @@
 #![allow(
-    clippy::await_holding_lock,
     clippy::doc_markdown,
     clippy::match_same_arms,
     clippy::must_use_candidate,
@@ -190,23 +189,16 @@ impl McpToolRegistry {
                 runtime.block_on(async move {
                     let response = {
                         let mut manager = manager
-                            .lock()
-                            .map_err(|_| "mcp server manager lock poisoned".to_string())?;
+                            .try_lock()
+                            .map_err(|_| "MCP server manager is busy; retry after the active MCP call finishes".to_string())?;
                         manager
                             .discover_tools()
                             .await
                             .map_err(|error| error.to_string())?;
-                        let response = manager
+                        manager
                             .call_tool(&qualified_tool_name, arguments)
                             .await
-                            .map_err(|error| error.to_string());
-                        let shutdown = manager.shutdown().await.map_err(|error| error.to_string());
-
-                        match (response, shutdown) {
-                            (Ok(response), Ok(())) => Ok(response),
-                            (Err(error), Ok(())) | (Err(error), Err(_)) => Err(error),
-                            (Ok(_), Err(error)) => Err(error),
-                        }
+                            .map_err(|error| error.to_string())
                     }?;
 
                     if let Some(error) = response.error {
